@@ -11,7 +11,7 @@ version := "0.1"
 scalaVersion := "2.12.4"
 
 scalagenGenerators := Set(
-  Main
+  Main, Companion
 )
 
 TaskKey[Unit]("checkUntouchedHello") := {

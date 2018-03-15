@@ -30,13 +30,21 @@ object ScalagenPlugin extends AutoPlugin {
     lazy val scalagenGenerators = settingKey[Set[Generator]]("Set of Generators to use")
 
     lazy val generateTask = Def.task {
-      GeneratorRunner(
+      val c = GeneratorRunner(
         (unmanagedSources in Compile).value,
         scalagenGenerators.value,
         scalagenRecursive.value,
         streams.value,
         sourceDirectory.value.toPath,
         sourceManaged.value.toPath)
+      val t = GeneratorRunner(
+        (unmanagedSources in Test).value,
+        scalagenGenerators.value,
+        scalagenRecursive.value,
+        streams.value,
+        sourceDirectory.value.toPath,
+        sourceManaged.value.toPath)        
+      c ++ t
     }
   }
 
@@ -46,9 +54,36 @@ object ScalagenPlugin extends AutoPlugin {
     scalagenGenerators := Set.empty,
     scalagenRecursive := false,
     scalagen := generateTask.value,
-    (sources in Compile) := ((sources in Compile).value.toSet[File] --
-      (unmanagedSources in Compile).value.toSet[File]).toSeq,
-    sourceGenerators in Compile += scalagen
+    (sources in Compile) := {
+      GeneratorRunner.deleteNoLongerManaged(
+        (managedSources in Compile).value,
+        scalagenGenerators.value,
+        (sourceDirectory in Compile).value.toPath,
+        (sourceManaged in Compile).value.toPath
+      )
+      val overrided = GeneratorRunner.overridedSources(
+        (managedSources in Compile).value,
+        (sourceDirectory in Compile).value.toPath,
+        (sourceManaged in Compile).value.toPath
+      )
+      ((sources in Compile).value.toSet[File] -- overrided.toSet[File]).toSeq
+    },
+    (sources in Test) := {
+      GeneratorRunner.deleteNoLongerManaged(
+        (managedSources in Test).value,
+        scalagenGenerators.value,
+        (sourceDirectory in Test).value.toPath,
+        (sourceManaged in Test).value.toPath
+      )      
+      val overrided = GeneratorRunner.overridedSources(
+        (managedSources in Test).value,
+        (sourceDirectory in Test).value.toPath,
+        (sourceManaged in Test).value.toPath
+      )
+      ((sources in Test).value.toSet[File] -- overrided.toSet[File]).toSeq
+    },    
+    sourceGenerators in Compile += scalagen,
+    sourceGenerators in Test += scalagen
   )
 
   override lazy val projectSettings: Seq[Def.Setting[_]] =
@@ -56,6 +91,41 @@ object ScalagenPlugin extends AutoPlugin {
 }
 
 object GeneratorRunner {
+ def overridedSources(
+      input: Seq[File],
+      sourcePath: Path,
+      targetPath: Path): Seq[File] = {
+      input.map{f =>
+        val relative = targetPath.relativize(f.toPath)
+        val originalFile = sourcePath.resolve(relative).toFile
+        originalFile
+      }        
+  }
+
+  def deleteNoLongerManaged(
+      managed: Seq[File],
+      generators: Set[Generator],
+      sourcePath: Path,
+      targetPath: Path) {
+
+    val allManaged = (targetPath.toFile ** "*.scala").get
+    val del = allManaged.filter{ case f => 
+      !managed.contains(f)
+    //   val t = scala.util.Try {
+    //     val relative = targetPath.relativize(f.toPath)
+    //     val originalFile = sourcePath.resolve(relative).toFile
+    //     val n = originalFile.exists && {
+    //       val text = IO.read(originalFile)
+    //       generators.isEmpty || !generators.exists{g => text.contains(s"@${g.name}")}
+    //     }
+    //     println(f+" "+n+" "+originalFile.exists)
+    //     !originalFile.exists || n
+    //   }
+    //   t.getOrElse(false)
+    }
+    del.foreach{f => IO.delete(f) }    
+  }
+
   def apply(
       input: Seq[File],
       generators: Set[Generator],
@@ -63,22 +133,26 @@ object GeneratorRunner {
       strm: TaskStreams,
       sourcePath: Path,
       targetPath: Path): Seq[File] = {
-    input.par
-      .map { f =>
-        val runner = Runner(generators, recurse)
+    val validInput = input.par.flatMap{f =>
+      val text = IO.read(f)
+      if(!generators.isEmpty && generators.exists{g => text.contains(s"@${g.name}")}) Some(f -> text) else None
+    }
 
-        val text = IO.read(f)
+    validInput.par
+      .map{ case (f,text) =>
+        val runner = Runner(generators, recurse)
         val parsed = text.parse[Source]
         val relative = sourcePath.relativize(f.toPath)
         val outputFile = targetPath.resolve(relative).toFile
-        val result: String = parsed.toOption
-          .map(runner.transform(_).syntax)
-          .getOrElse {
-            strm.log.warn(s"Skipped ${f.name} as it could not be parsed")
-            text
-          }
-
-        IO.write(outputFile, result)
+        if( f.lastModified() > outputFile.lastModified() ) {
+          val result: String = parsed.toOption
+            .map(runner.transform(_).syntax)
+            .getOrElse {
+              strm.log.warn(s"Skipped ${f.name} as it could not be parsed")
+              text
+            }
+          IO.write(outputFile, result)
+        }
         outputFile
       }
       .to[Seq]
